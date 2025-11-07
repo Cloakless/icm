@@ -161,6 +161,12 @@ def load_icm_dataset(
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
     
+    if not examples:
+        raise ValueError(
+            f"Dataset {dataset_name} produced 0 examples for task '{task_type}'. "
+            "Verify that the file format matches the expected structure."
+        )
+
     # Create dataset
     dataset = ICMDataset(examples, {"task_type": task_type, "source": dataset_name})
     
@@ -346,22 +352,53 @@ def _convert_truthfulqa(examples: List[Dict[str, Any]]) -> List[ICMExample]:
     for example in examples:
         question = example.get("question", "")
         
-        # Handle multiple choice answers
+        # Handle multiple choice answers from the Hugging Face TruthfulQA format
         if "mc1_targets" in example:
-            choices = example["mc1_targets"]["choices"]
+            choices = example["mc1_targets"].get("choices", [])
             
             # Use ALL actual choices from the dataset - let ICM discover which are true
             for choice in choices:
-                input_text = f"Question: {question}\nAnswer: {choice}\nClaim: This answer is truthful\nI think this Claim is [True/False]"
+                input_text = (
+                    f"Question: {question}\n"
+                    f"Answer: {choice}\n"
+                    "Claim: This answer is truthful\n"
+                    "I think this Claim is [True/False]"
+                )
                 metadata = {
                     "question": question,
                     "choice": choice,
                     "task": "truthfulness",
-                    "response_text": choice,  # Just the answer for clean DPO responses
-                    "prompt_text": question  # Store question separately
-                    # No gold_label - ICM will determine this through internal coherence
+                    "response_text": choice,
+                    "prompt_text": question,
                 }
                 icm_examples.append(ICMExample(input_text, metadata))
+        
+        # Handle TruthfulQA format with explicit choices stored under "choice"
+        elif "choice" in example:
+            choice = example.get("choice", "")
+            label = example.get("label")
+            consistency_id = example.get("consistency_id")
+
+            input_text = (
+                f"Question: {question}\n"
+                f"Answer: {choice}\n"
+                "Claim: This answer is truthful\n"
+                "I think this Claim is [True/False]"
+            )
+            metadata = {
+                "question": question,
+                "choice": choice,
+                "task": "truthfulness",
+                "response_text": choice,
+                "prompt_text": question,
+            }
+
+            if label is not None:
+                metadata["original_label"] = label
+            if consistency_id is not None:
+                metadata["consistency_id"] = consistency_id
+
+            icm_examples.append(ICMExample(input_text, metadata))
         
         # Handle best answer format
         elif "best_answer" in example:
@@ -372,14 +409,18 @@ def _convert_truthfulqa(examples: List[Dict[str, Any]]) -> List[ICMExample]:
             all_answers = [best_answer] + incorrect_answers[:5]  # Limit to reasonable number
             
             for answer in all_answers:
-                input_text = f"Question: {question}\nAnswer: {answer}\nClaim: This answer is truthful\nI think this Claim is [True/False]"
+                input_text = (
+                    f"Question: {question}\n"
+                    f"Answer: {answer}\n"
+                    "Claim: This answer is truthful\n"
+                    "I think this Claim is [True/False]"
+                )
                 metadata = {
                     "question": question,
                     "answer": answer,
                     "task": "truthfulness",
-                    "response_text": answer,  # Just the answer for clean DPO responses
-                    "prompt_text": question  # Store question separately
-                    # No gold_label - ICM will determine this through internal coherence
+                    "response_text": answer,
+                    "prompt_text": question,
                 }
                 icm_examples.append(ICMExample(input_text, metadata))
     

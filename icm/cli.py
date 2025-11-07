@@ -71,6 +71,8 @@ def run_icm(args):
         consistency_checker = LogicalConsistencyChecker()
         
         # Create ICM searcher
+        mutual_sample_size = args.mutual_sample_size if args.mutual_sample_size and args.mutual_sample_size > 0 else None
+
         searcher = ICMSearcher(
             model_name=args.model,
             device=args.device,
@@ -84,6 +86,7 @@ def run_icm(args):
             generation_temperature=args.generation_temperature,
             generation_top_p=args.generation_top_p,
             generation_max_tokens=args.generation_max_tokens,
+            mutual_predict_sample_size=mutual_sample_size,
             consistency_checker=consistency_checker,
             confidence_threshold=args.confidence_threshold,
             seed=args.seed,
@@ -424,12 +427,14 @@ def parse_args():
                            choices=["jsonl", "json", "csv"], help="Output format")
     
     # ICM algorithm parameters
-    run_parser.add_argument("--alpha", type=float, default=100.0, help="Weight for mutual predictability vs consistency")
-    run_parser.add_argument("--initial-temperature", type=float, default=3.0, help="Initial temperature for simulated annealing")
-    run_parser.add_argument("--final-temperature", type=float, default=0.001, help="Final temperature for simulated annealing")
-    run_parser.add_argument("--cooling-rate", type=float, default=0.98, help="Temperature cooling rate")
+    run_parser.add_argument("--alpha", type=float, default=50.0, help="Weight for mutual predictability vs consistency")
+    run_parser.add_argument("--initial-temperature", type=float, default=10.0, help="Initial temperature for simulated annealing")
+    run_parser.add_argument("--final-temperature", type=float, default=0.01, help="Final temperature for simulated annealing")
+    run_parser.add_argument("--cooling-rate", type=float, default=0.99, help="Temperature cooling rate")
     run_parser.add_argument("--initial-examples", type=int, default=20, help="Number of initial randomly labeled examples (K)")
     run_parser.add_argument("--max-iterations", type=int, default=1000, help="Maximum iterations")
+    run_parser.add_argument("--mutual-sample-size", type=int, default=20,
+                           help="Context examples to sample when computing mutual predictability (<=0 uses all)")
     run_parser.add_argument("--consistency-fix-iterations", type=int, default=10, 
                            help="Max iterations for consistency fixing")
     run_parser.add_argument("--confidence-threshold", type=float, default=0.1, 

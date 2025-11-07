@@ -9,13 +9,13 @@ import logging
 import random
 import math
 import traceback
+import os
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
-import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 import json
+from openai import OpenAI
 
 from .consistency import LogicalConsistencyChecker
 from .datasets import ICMDataset, ICMExample
@@ -42,28 +42,29 @@ class ICMSearcher:
     def __init__(
         self,
         model_name: str,
-        device: Optional[str] = None,
-        alpha: float = 100.0,
-        initial_temperature: float = 3.0,
-        final_temperature: float = 0.001,
-        cooling_rate: float = 0.98,
+        device: Optional[str] = None,  # Kept for compatibility but not used with API
+        alpha: float = 50.0,
+        initial_temperature: float = 10.0,
+        final_temperature: float = 0.01,
+        cooling_rate: float = 0.99,
         initial_examples: int = 20,
         max_iterations: int = 1000,
         consistency_fix_iterations: int = 10,
         generation_temperature: float = 0.2,
         generation_top_p: float = 0.9,
         generation_max_tokens: int = 512,
+        mutual_predict_sample_size: Optional[int] = 10,
         consistency_checker: Optional[LogicalConsistencyChecker] = None,
         confidence_threshold: float = 0.1,
         seed: int = 42,
         log_level: str = "INFO"
     ):
         """
-        Initialize ICM searcher.
+        Initialize ICM searcher with Hyperbolic API.
         
         Args:
-            model_name: Name or path of the model to use
-            device: Device to run on ("cuda", "mps", "cpu", "auto", or None for auto-detection)
+            model_name: Name of the model to use on Hyperbolic
+            device: Deprecated (kept for compatibility)
             alpha: Weight for mutual predictability vs consistency
             initial_temperature: Starting temperature for simulated annealing
             final_temperature: Ending temperature for simulated annealing
@@ -74,23 +75,14 @@ class ICMSearcher:
             generation_temperature: Temperature for text generation
             generation_top_p: Top-p for text generation
             generation_max_tokens: Max tokens for generation
+            mutual_predict_sample_size: Number of context examples to sample when
+                computing mutual predictability (None uses all available)
             consistency_checker: Custom consistency checker
             confidence_threshold: Minimum confidence to label an example (0-1)
             seed: Random seed
             log_level: Logging level
         """
         self.model_name = model_name
-        
-        # Smart device selection with priority: CUDA > MPS > CPU
-        if device == "auto" or device is None:
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-        else:
-            self.device = device
         
         self.alpha = alpha
         self.initial_temperature = initial_temperature
@@ -102,6 +94,7 @@ class ICMSearcher:
         self.generation_temperature = generation_temperature
         self.generation_top_p = generation_top_p
         self.generation_max_tokens = generation_max_tokens
+        self.mutual_predict_sample_size = mutual_predict_sample_size
         self.confidence_threshold = confidence_threshold
         self.seed = seed
         
@@ -109,109 +102,21 @@ class ICMSearcher:
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(getattr(logging, log_level.upper()))
         
-        # Log device selection
-        available_devices = []
-        if torch.cuda.is_available():
-            available_devices.append("cuda")
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            available_devices.append("mps")
-        available_devices.append("cpu")
-        
-        self.logger.info(f"Device selection: {self.device}")
-        self.logger.info(f"Available devices: {', '.join(available_devices)}")
-        
         # Set random seeds
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
         
-        # Setup device optimizations
-        if self.device == "cuda" and torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
-            torch.cuda.empty_cache()
-            
-            # Enable TensorFloat-32 for better performance on Ampere+ GPUs
-            if torch.cuda.get_device_capability()[0] >= 8:  # Ampere (A100, RTX 30xx) or newer
-                torch.set_float32_matmul_precision('high')
-                self.logger.info("Enabled TensorFloat-32 (TF32) for improved performance")
-            
-            self.logger.info("Applied CUDA optimizations")
+        # Initialize Hyperbolic API client
+        api_key = os.environ.get("HYPERBOLIC_API_KEY")
+        if not api_key:
+            raise ValueError("HYPERBOLIC_API_KEY environment variable not set")
         
-        # Load model and tokenizer
-        self.logger.info(f"Loading model {model_name} on device {self.device}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.hyperbolic.xyz/v1"
+        )
         
-        # Configure tokenizer
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Set a reasonable max_length to avoid truncation warnings
-        if not hasattr(self.tokenizer, 'model_max_length') or self.tokenizer.model_max_length > 100000:
-            self.tokenizer.model_max_length = 2048  # Reasonable default
-        
-        # Configure model loading based on device
-        model_kwargs = {}
-        if self.device == "cuda":
-            # Only use device_map for large models that need multi-GPU
-            # Check model size from config to decide
-            from transformers import AutoConfig
-            config = AutoConfig.from_pretrained(model_name)
-            
-            # Use the dtype specified in model config if available
-            if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
-                # Model has a preferred dtype (e.g., bfloat16 for Gemma-3-270M)
-                if config.torch_dtype == torch.bfloat16:
-                    # Check if bfloat16 is supported
-                    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                        model_kwargs["torch_dtype"] = torch.bfloat16
-                        self.logger.info(f"Using bfloat16 as specified by model config")
-                    else:
-                        # Fallback to float32 if bfloat16 not supported
-                        model_kwargs["torch_dtype"] = torch.float32
-                        self.logger.warning(f"Model prefers bfloat16 but it's not supported, using float32")
-                else:
-                    model_kwargs["torch_dtype"] = config.torch_dtype
-                    self.logger.info(f"Using {config.torch_dtype} as specified by model config")
-            else:
-                # Default to float16 for CUDA if no preference specified
-                model_kwargs["torch_dtype"] = torch.float16
-            
-            # Estimate model size: params = hidden_size * layers * 4 (rough estimate)
-            # Models under 1B params can typically fit on a single GPU
-            estimated_params = getattr(config, 'num_parameters', None)
-            
-            if estimated_params is None:
-                # Estimate based on config attributes if num_parameters not available
-                hidden_size = getattr(config, 'hidden_size', 768)
-                num_layers = getattr(config, 'num_hidden_layers', 12)
-                estimated_params = hidden_size * num_layers * 4 * 1000  # Rough estimate
-            
-            # Only use device_map for models > 1B parameters
-            if estimated_params > 1_000_000_000:
-                model_kwargs["device_map"] = "auto"
-                self.logger.info(f"Using device_map='auto' for large model ({estimated_params:,} params)")
-        elif self.device == "mps":
-            # Special handling for Gemma models on MPS - they need fp32 to avoid NaN/inf errors
-            if "gemma" in model_name.lower():
-                model_kwargs["torch_dtype"] = torch.float32
-                self.logger.info("Using float32 for Gemma model on MPS to avoid numerical instability")
-            else:
-                model_kwargs["torch_dtype"] = torch.float16  # MPS supports float16 for other models
-        else:  # CPU
-            model_kwargs["torch_dtype"] = torch.float32
-        
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-        
-        # Get vocabulary size from model config
-        self.vocab_size = self.model.config.vocab_size
-        self.logger.info(f"Model vocabulary size: {self.vocab_size}")
-        
-        # Move model to device if not using device_map
-        if "device_map" not in model_kwargs:
-            self.model = self.model.to(self.device)
+        self.logger.info(f"Initialized Hyperbolic API client with model: {model_name}")
         
         # Initialize consistency checker
         self.consistency_checker = consistency_checker or LogicalConsistencyChecker()
@@ -248,11 +153,13 @@ class ICMSearcher:
         # Initialize with K randomly labeled examples
         labeled_data = self._initialize_labeled_data(examples, task_type)
         
-        # Run consistency fix on initial data
-        labeled_data = self._fix_inconsistencies(labeled_data)
+        # Run consistency fix on initial data (disabled for this task)
+        # labeled_data = self._fix_inconsistencies(labeled_data)
         
-        # Main search loop
-        best_score = self._calculate_score(labeled_data)
+        # Pre-compute mutual predictability components for the initial state
+        current_mutual_predictability = self._calculate_mutual_predictability(labeled_data) if labeled_data else 0.0
+        initial_inconsistency_penalty = len(self._find_inconsistencies(labeled_data)) if labeled_data else 0
+        best_score = self.alpha * current_mutual_predictability - initial_inconsistency_penalty
         temperature = self.initial_temperature
         
         self.logger.info(f"Initial score: {best_score:.4f}")
@@ -273,11 +180,6 @@ class ICMSearcher:
                     # Generate label for the example
                     new_label = self._generate_label(example, labeled_data, task_type)
                     
-                    # Calculate confidence for this labeling decision (for logging only)
-                    confidence = self._calculate_example_confidence(
-                        example_idx, example, new_label, labeled_data, best_score
-                    )
-                    
                     # Create new labeled data with the proposed label
                     new_labeled_data = labeled_data.copy()
                     new_labeled_data[example_idx] = {
@@ -286,18 +188,26 @@ class ICMSearcher:
                         "index": example_idx
                     }
                     
-                    # Fix inconsistencies
-                    new_labeled_data = self._fix_inconsistencies(new_labeled_data)
+                    # Fix inconsistencies (disabled for this task)
+                    # new_labeled_data = self._fix_inconsistencies(new_labeled_data)
+                    
+                    # Calculate mutual predictability and score for the proposal
+                    new_mutual_predictability = self._calculate_mutual_predictability(new_labeled_data)
+                    new_inconsistency_penalty = len(self._find_inconsistencies(new_labeled_data))
+                    confidence = self._calculate_example_confidence(
+                        new_mutual_predictability,
+                        current_mutual_predictability
+                    )
+                    new_score = self.alpha * new_mutual_predictability - new_inconsistency_penalty
                     
                     # Calculate new score
-                    new_score = self._calculate_score(new_labeled_data)
-                    
                     # Accept or reject based on simulated annealing
                     delta = new_score - best_score
                     
                     if delta > 0 or random.random() < math.exp(delta / temperature):
                         labeled_data = new_labeled_data
                         best_score = new_score
+                        current_mutual_predictability = new_mutual_predictability
                         self.logger.debug(f"Iteration {iteration}: Accepted example {example_idx}, confidence {confidence:.3f}, score = {best_score:.4f}")
                     else:
                         self.logger.debug(f"Iteration {iteration}: Rejected, score = {new_score:.4f}")
@@ -456,28 +366,16 @@ class ICMSearcher:
         # Create prompt for label prediction
         prompt = self._build_prediction_prompt(example, context_examples, task_type)
         
-        # Generate label using the model
+        # Generate label using the API
         try:
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=min(1024, self.tokenizer.model_max_length)  # Explicit max_length
+            response = self.client.completions.create(
+                model=self.model_name,
+                prompt=prompt,
+                max_tokens=10,
+                temperature=self.generation_temperature,
+                top_p=self.generation_top_p
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=10,  # Short for labels
-                    temperature=self.generation_temperature,
-                    top_p=self.generation_top_p,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-            
-            generated_text = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            generated_text = response.choices[0].text
             
             # Extract label from generated text
             label = self._extract_label(generated_text, task_type)
@@ -638,6 +536,10 @@ class ICMSearcher:
                         "label": data["label"]
                     })
             
+            if self.mutual_predict_sample_size is not None and \
+                    len(context_examples) > self.mutual_predict_sample_size:
+                context_examples = random.sample(context_examples, self.mutual_predict_sample_size)
+
             if not context_examples:
                 continue
             
@@ -659,144 +561,89 @@ class ICMSearcher:
         target_label: str, 
         context_examples: List[Dict[str, Any]]
     ) -> float:
-        """Calculate log P(target_label | target_example, context_examples)."""
+        """Calculate log P(target_label | target_example, context_examples) using API."""
         try:
             # Build prompt with context
             prompt = self._build_prediction_prompt(target_example, context_examples, "classification")
             
-            # Tokenize with explicit max_length
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                padding=True, 
-                truncation=True,
-                max_length=min(1024, self.tokenizer.model_max_length)
+            # Try to get logprobs from API and assert availability
+            response = self.client.completions.create(
+                model=self.model_name,
+                prompt=prompt,
+                max_tokens=1,
+                temperature=0.0,
+                logprobs=20
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Get model predictions
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                logits = outputs.logits[0, -1, :]  # Last token logits
-            
-            # Get probabilities for True/False tokens with multiple variants
-            true_tokens = []
-            false_tokens = []
-            
-            # Try multiple token variants
-            for variant in ["True", "true", "TRUE", "correct", "yes"]:
-                try:
-                    token_ids = self.tokenizer.encode(variant, add_special_tokens=False)
-                    if token_ids:
-                        true_tokens.append(token_ids[0])
-                except:
-                    pass
-            
-            for variant in ["False", "false", "FALSE", "incorrect", "no"]:
-                try:
-                    token_ids = self.tokenizer.encode(variant, add_special_tokens=False)
-                    if token_ids:
-                        false_tokens.append(token_ids[0])
-                except:
-                    pass
-            
-            # Get maximum logit for each category with bounds checking
-            # Verify logits tensor matches expected vocabulary size
-            logits_vocab_size = logits.size(-1)
-            if logits_vocab_size != self.vocab_size:
-                self.logger.warning(f"Logits size {logits_vocab_size} doesn't match model vocab size {self.vocab_size}")
 
-            # Use the minimum of actual logits size and expected vocab size for safety
-            effective_vocab_size = min(logits_vocab_size, self.vocab_size)
+            choice = response.choices[0]
+            logprobs = choice.logprobs
 
-            # Filter tokens to ensure they're within valid range
-            valid_true_tokens = [tid for tid in true_tokens if 0 <= tid < effective_vocab_size]
-            valid_false_tokens = [tid for tid in false_tokens if 0 <= tid < effective_vocab_size]
+            if not logprobs or not logprobs.top_logprobs:
+                raise ValueError(
+                    "Model response did not include logprobs. Ensure the selected model "
+                    "supports logprob outputs and that the API request enables them."
+                )
 
-            # Debug logging if tokens are filtered
-            if len(true_tokens) > len(valid_true_tokens):
-                filtered = [t for t in true_tokens if t >= effective_vocab_size]
-                self.logger.debug(f"Filtered out-of-bounds true tokens: {filtered}")
-            if len(false_tokens) > len(valid_false_tokens):
-                filtered = [t for t in false_tokens if t >= effective_vocab_size]
-                self.logger.debug(f"Filtered out-of-bounds false tokens: {filtered}")
-            
-            # Convert Python integers to tensor indices on correct device for CUDA compatibility
-            if valid_true_tokens:
-                # Convert to tensor on same device as logits for proper indexing
-                token_indices = torch.tensor(valid_true_tokens, device=logits.device, dtype=torch.long)
-                true_logit = logits[token_indices].max().item()
-            else:
-                true_logit = -float('inf')
+            top_logprobs = logprobs.top_logprobs[0]
 
-            if valid_false_tokens:
-                token_indices = torch.tensor(valid_false_tokens, device=logits.device, dtype=torch.long)
-                false_logit = logits[token_indices].max().item()
-            else:
-                false_logit = -float('inf')
-            
-            # Apply softmax
-            exp_true = math.exp(true_logit)
-            exp_false = math.exp(false_logit)
-            total = exp_true + exp_false
-            
+            true_variants = {"true", " true", "True", " True", "correct", " correct", "yes", " yes"}
+            false_variants = {"false", " false", "False", " False", "incorrect", " incorrect", "no", " no"}
+
+            true_logprob = -float('inf')
+            false_logprob = -float('inf')
+
+            for token, token_lp in top_logprobs.items():
+                if token in true_variants:
+                    true_logprob = max(true_logprob, token_lp)
+                elif token in false_variants:
+                    false_logprob = max(false_logprob, token_lp)
+
+            if true_logprob == -float('inf') or false_logprob == -float('inf'):
+                raise ValueError(
+                    "Logprobs did not contain both true/false variants. "
+                    "Increase top_logprobs or adjust token variants."
+                )
+
+            max_logprob = max(true_logprob, false_logprob)
+            true_prob = math.exp(true_logprob - max_logprob)
+            false_prob = math.exp(false_logprob - max_logprob)
+            total = true_prob + false_prob
+
             if target_label == "True":
-                prob = exp_true / total
+                prob = true_prob / total
             else:
-                prob = exp_false / total
-            
-            # Return log probability
-            return math.log(max(prob, 1e-10))  # Avoid log(0)
+                prob = false_prob / total
+
+            return math.log(max(prob, 1e-10))
         
         except Exception as e:
             self.logger.warning(f"Error calculating conditional probability: {e}")
             return -10.0  # Large negative log probability
 
     def _calculate_example_confidence(
-        self, 
-        example_idx: int,
-        example: ICMExample,
-        new_label: str,
-        labeled_data: Dict[int, Dict[str, Any]],
-        current_score: float
+        self,
+        new_mutual_predictability: float,
+        current_mutual_predictability: float
     ) -> float:
         """
-        Calculate confidence for labeling a specific example.
+        Calculate confidence for a proposed labeling based on the change in
+        mutual predictability.
         
-        Confidence is based on how much the mutual predictability improves
-        when we add this example with the proposed label.
-        
-        Returns:
-            float: Confidence score (0 to 1), higher is more confident
+        Args:
+            new_mutual_predictability: Mutual predictability after applying the label
+            current_mutual_predictability: Mutual predictability before applying the label
         """
         try:
-            # Create temporary labeled data with the new example
-            temp_labeled_data = labeled_data.copy()
-            temp_labeled_data[example_idx] = {
-                "example": example,
-                "label": new_label,
-                "index": example_idx
-            }
-            
-            # Calculate the new mutual predictability
-            new_mutual_predictability = self._calculate_mutual_predictability(temp_labeled_data)
-            
-            # Calculate current mutual predictability (without this example)
-            current_mutual_predictability = self._calculate_mutual_predictability(labeled_data) if labeled_data else 0.0
-            
-            # Confidence is the improvement in mutual predictability, normalized
             improvement = new_mutual_predictability - current_mutual_predictability
-            
-            # Normalize based on the scale of current mutual predictability
-            # Use a reasonable normalization factor that doesn't depend on alpha
             normalization = max(1.0, abs(current_mutual_predictability) * 0.1) if current_mutual_predictability != 0 else 1.0
             confidence = max(0.0, min(1.0, improvement / normalization))
-            
-            # Log the confidence calculation for debugging
-            self.logger.debug(f"Confidence calculation: improvement={improvement:.4f}, normalization={normalization:.4f}, confidence={confidence:.4f}")
-            
+            self.logger.debug(
+                "Confidence calculation: improvement=%.4f, normalization=%.4f, confidence=%.4f",
+                improvement,
+                normalization,
+                confidence
+            )
             return confidence
-            
         except Exception as e:
             self.logger.warning(f"Error calculating example confidence: {e}")
-            return 0.0  # Low confidence on error
+            return 0.0

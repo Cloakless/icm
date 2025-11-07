@@ -23,6 +23,28 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
+## API Setup
+
+ICM now uses the **Hyperbolic API** to query models instead of loading them locally. This provides several benefits:
+- No need for GPU/local compute resources
+- Access to larger models without memory constraints
+- Faster iteration and experimentation
+
+### Setting up Hyperbolic API
+
+1. Get your API key from [Hyperbolic](https://hyperbolic.xyz)
+2. Set the environment variable:
+
+```bash
+export HYPERBOLIC_API_KEY="your-api-key-here"
+```
+
+Or add it to your `.bashrc`/`.zshrc`:
+```bash
+echo 'export HYPERBOLIC_API_KEY="your-api-key-here"' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ## Quick Start
 
 ### Basic Usage
@@ -30,7 +52,11 @@ pip install -r requirements.txt
 Generate a labeled dataset using ICM:
 
 ```bash
-icm run --model google/gemma-3-1b-it --dataset truthful_qa --task-type truthfulqa --max-examples 100
+# Set your API key first
+export HYPERBOLIC_API_KEY="your-api-key-here"
+
+# Run ICM with any model available on Hyperbolic
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset truthful_qa --task-type truthfulqa --max-examples 100
 ```
 
 ### Export to Training Format
@@ -74,24 +100,24 @@ Where:
 ### TruthfulQA (Truthfulness)
 ```bash
 # Fully automatic - detects config='multiple_choice' and split='validation'
-icm run --model google/gemma-3-1b-it --dataset truthful_qa --task-type truthfulqa
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset truthful_qa --task-type truthfulqa
 
 # Or explicitly specify parameters
-icm run --model google/gemma-3-1b-it --dataset truthful_qa --config multiple_choice --split validation --task-type truthfulqa
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset truthful_qa --config multiple_choice --split validation --task-type truthfulqa
 ```
 
 ### GSM8K (Mathematical Reasoning)
 ```bash
 # Fully automatic - detects config='main'
-icm run --model google/gemma-3-1b-it --dataset gsm8k --task-type gsm8k
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset gsm8k --task-type gsm8k
 
 # Or explicitly specify parameters
-icm run --model google/gemma-3-1b-it --dataset gsm8k --config main --task-type gsm8k
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset gsm8k --config main --task-type gsm8k
 ```
 
 ### Custom Datasets
 ```bash
-icm run --model google/gemma-3-1b-it --dataset path/to/dataset.jsonl --task-type classification
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset path/to/dataset.jsonl --task-type classification
 ```
 
 ## Synthetic Datasets
@@ -141,13 +167,13 @@ I think this Claim is [True/False]
 
 ```bash
 # Math problems - creates 1000 examples (500 pairs)
-icm run --model google/gemma-3-1b-it --synthetic math --synthetic-size 500
+icm run --model meta-llama/Llama-3.3-70B-Instruct --synthetic math --synthetic-size 500
 
 # Number comparisons - creates 300 examples  
-icm run --model google/gemma-3-1b-it --synthetic comparison --synthetic-size 300
+icm run --model meta-llama/Llama-3.3-70B-Instruct --synthetic comparison --synthetic-size 300
 
 # Quick test with defaults (100 examples)
-icm run --model google/gemma-3-1b-it --synthetic math
+icm run --model meta-llama/Llama-3.3-70B-Instruct --synthetic math
 ```
 
 ### Why Use Synthetic Datasets?
@@ -178,7 +204,7 @@ All synthetic examples follow the standard ICM format:
 Run ICM on a dataset to generate labeled examples.
 
 **Required Arguments:**
-- `--model`: Model name or path (e.g., `google/gemma-3-1b-it`)
+- `--model`: Model name available on Hyperbolic (e.g., `meta-llama/Llama-3.3-70B-Instruct`)
 
 **Dataset Arguments:**
 - `--dataset`: Dataset name or path
@@ -191,12 +217,15 @@ Run ICM on a dataset to generate labeled examples.
 - `--synthetic-size`: Number of synthetic examples to generate (default: 100)
 
 **ICM Algorithm Parameters:**
-- `--alpha`: Weight for mutual predictability vs consistency (default: 100.0)
-- `--initial-temperature`: Starting temperature for simulated annealing (default: 3.0)
-- `--final-temperature`: Ending temperature (default: 0.001)
-- `--cooling-rate`: Temperature cooling rate (default: 0.98)
+- `--alpha`: Weight for mutual predictability vs consistency (default: 50.0)
+- `--initial-temperature`: Starting temperature for simulated annealing (default: 10.0)
+- `--final-temperature`: Ending temperature (default: 0.01)
+- `--cooling-rate`: Temperature cooling rate (default: 0.99)
 - `--initial-examples`: Number of initial random examples (default: 20)
 - `--max-iterations`: Maximum search iterations (default: 1000)
+- `--mutual-sample-size`: Context examples sampled for mutual predictability (default: 20, <=0 uses all)
+
+Alpha tip: start with the default `50.0`, but if the search begins rejecting nearly every move you can lower it to `20` or `30` to loosen the acceptance criteria—no validation set is required for that adjustment.
 
 **Generation Parameters:**
 - `--generation-temperature`: Temperature for text generation (default: 0.2)
@@ -204,7 +233,7 @@ Run ICM on a dataset to generate labeled examples.
 - `--generation-max-tokens`: Maximum tokens to generate (default: 512)
 
 **System Parameters:**
-- `--device`: Computation device (`cuda`, `cpu`, `auto`)
+- `--device`: Deprecated (kept for compatibility, not used with API)
 - `--seed`: Random seed for reproducibility (default: 42)
 - `--log-level`: Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
@@ -304,14 +333,18 @@ export ICM_LOG_LEVEL="INFO"
 ### Basic Usage
 
 ```python
+import os
 from icm import ICMSearcher, load_icm_dataset
+
+# Set your API key
+os.environ["HYPERBOLIC_API_KEY"] = "your-api-key-here"
 
 # Load dataset
 dataset = load_icm_dataset("truthful_qa", task_type="truthfulqa")
 
-# Create searcher
+# Create searcher (uses Hyperbolic API)
 searcher = ICMSearcher(
-    model_name="google/gemma-3-1b-it",
+    model_name="meta-llama/Llama-3.3-70B-Instruct",
     alpha=50.0,
     max_iterations=1000
 )
@@ -327,8 +360,12 @@ print(f"Final score: {result.score:.4f}")
 ### Advanced Usage
 
 ```python
+import os
 from icm import ICMSearcher, ICMDataset, ICMExample
 from icm.consistency import LogicalConsistencyChecker, MathConsistencyRule
+
+# Set your API key
+os.environ["HYPERBOLIC_API_KEY"] = "your-api-key-here"
 
 # Create custom dataset
 examples = [
@@ -340,9 +377,9 @@ dataset = ICMDataset(examples)
 # Custom consistency checker
 checker = LogicalConsistencyChecker([MathConsistencyRule()])
 
-# Advanced searcher
+# Advanced searcher (uses Hyperbolic API)
 searcher = ICMSearcher(
-    model_name="google/gemma-3-1b-it",
+    model_name="meta-llama/Llama-3.3-70B-Instruct",
     alpha=30.0,
     initial_temperature=20.0,
     consistency_checker=checker,
@@ -384,17 +421,17 @@ exporter.export_to_huggingface(
 
 ```bash
 # Create synthetic math dataset
-icm run --model google/gemma-3-1b-it --synthetic math --synthetic-size 500 --max-iterations 500
+icm run --model meta-llama/Llama-3.3-70B-Instruct --synthetic math --synthetic-size 500 --max-iterations 500
 
 # Use real GSM8K dataset  
-icm run --model google/gemma-3-1b-it --dataset gsm8k --task-type gsm8k --max-examples 200
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset gsm8k --task-type gsm8k --max-examples 200
 ```
 
 ### Comparison Tasks
 
 ```bash
 # Generate preference dataset
-icm run --model google/gemma-3-1b-it --dataset anthropic/hh-rlhf --task-type comparison --alpha 30.0
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset anthropic/hh-rlhf --task-type comparison --alpha 30.0
 ```
 
 ### Export and Use
@@ -411,18 +448,26 @@ icm export --input-path results.jsonl --output-path analysis.json --format analy
 
 ### Common Issues
 
-**CUDA Out of Memory:**
+**API Key Not Set:**
 ```bash
-# Use smaller model, MPS (Apple Silicon), or CPU
-icm run --model google/gemma-3-1b-it --device cpu
-# or on Apple Silicon:
-icm run --model google/gemma-3-1b-it --device mps
+# Make sure your Hyperbolic API key is set
+export HYPERBOLIC_API_KEY="your-api-key-here"
+
+# Verify it's set
+echo $HYPERBOLIC_API_KEY
 ```
 
-**Model Loading Errors:**
+**API Rate Limits:**
 ```bash
-# Verify model name and check internet connection
-icm run --model google/gemma-3-1b-it --log-level DEBUG
+# If you hit rate limits, reduce the number of examples or iterations
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset your-data --max-examples 50 --max-iterations 500
+```
+
+**Model Not Available:**
+```bash
+# Verify the model name is available on Hyperbolic
+# Check https://hyperbolic.xyz for available models
+icm run --model meta-llama/Llama-3.3-70B-Instruct --log-level DEBUG
 ```
 
 **Poor Quality Results:**
@@ -438,22 +483,12 @@ icm run --model your-model --alpha 100.0 --max-iterations 2000
 # GSM8K: automatically uses config='main' and split='train'
 
 # Your commands should work automatically:
-icm run --model google/gemma-3-1b-it --dataset truthful_qa --task-type truthfulqa
-icm run --model google/gemma-3-1b-it --dataset gsm8k --task-type gsm8k
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset truthful_qa --task-type truthfulqa
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset gsm8k --task-type gsm8k
 
 # Or specify manually if needed:
-icm run --model google/gemma-3-1b-it --dataset truthful_qa --config multiple_choice --split validation --task-type truthfulqa
-icm run --model google/gemma-3-1b-it --dataset gsm8k --config main --task-type gsm8k
-```
-
-**Memory Usage Issues:**
-```bash
-# ICM uses memory-efficient sampling to handle large datasets
-# If you still encounter memory issues, reduce the dataset size:
-icm run --model google/gemma-3-1b-it --dataset large-dataset --max-examples 50
-
-# Or use a smaller model:
-icm run --model distilgpt2 --dataset your-dataset --max-examples 100
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset truthful_qa --config multiple_choice --split validation --task-type truthfulqa
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset gsm8k --config main --task-type gsm8k
 ```
 
 ### Debug Mode
@@ -461,7 +496,7 @@ icm run --model distilgpt2 --dataset your-dataset --max-examples 100
 Enable detailed logging:
 
 ```bash
-icm run --model google/gemma-3-1b-it --dataset your-data --log-level DEBUG --log-file debug.log
+icm run --model meta-llama/Llama-3.3-70B-Instruct --dataset your-data --log-level DEBUG --log-file debug.log
 ```
 
 ### Development Setup
